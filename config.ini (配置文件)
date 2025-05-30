@@ -1,0 +1,16 @@
+[DEFAULT]
+# 审计日志路径
+LOG_PATH = /var/log/audit/audit.log
+
+# 告警文件路径
+ALERT_FILE = security_alerts.json
+
+# 关键监控文件列表（逗号分隔）
+CRITICAL_FILES = /etc/passwd,/etc/shadow,/etc/sudoers,/bin/bash,/usr/bin/sudo,/usr/bin/docker
+
+[EMAIL]
+# 邮件发送配置
+FROM = audit-alert@yourdomain.com
+TO = admin@yourdomain.com
+SMTP_SERVER = localhost
+SMTP_PORT = 25
