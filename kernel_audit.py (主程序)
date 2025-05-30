@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+import re
+import subprocess
+import platform
+from datetime import datetime
+import smtplib
+import json
+import os
+import time
+import ctypes
+import struct
+import configparser
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# 加载配置
+config = configparser.ConfigParser()
+config.read('config.ini')
+
+# 获取正确的架构标识符
+def get_audit_arch():
+    """获取当前系统的审计架构标识符"""
+    machine = platform.machine()
+    if machine in ["x86_64", "amd64", "aarch64"]:
+        return "b64"
+    elif machine in ["i386", "i686", "armv7l"]:
+        return "b32"
+    return "b64"  # 默认使用64位
+
+# 安全规则配置
+SECURITY_RULES = {
+    "PRIV_ESCALATION": {
+        "pattern": r"uid=0.*auid!=[0-9]+",
+        "desc": "非特权用户执行root操作",
+        "severity": "CRITICAL"
+    },
+    "CONTAINER_ESCAPE": {
+        "pattern": r"exe=\"/usr/bin/docker\".*arg=\"run.*--privileged",
+        "desc": "特权容器启动",
+        "severity": "HIGH"
+    },
+    "DANGEROUS_CAP": {
+        "pattern": r"capability=(cap_sys_admin|cap_sys_ptrace)",
+        "desc": "危险能力授权",
+        "severity": "MEDIUM"
+    },
+    "MEMORY_ATTACK": {
+        "pattern": r"oom-kill",
+        "desc": "内存耗尽攻击",
+        "severity": "HIGH"
+    },
+    "KEY_MANIPULATION": {
+        "pattern": r"syscall=keyctl",
+        "desc": "内核密钥操作",
+        "severity": "MEDIUM"
+    },
+    "BPF_OPERATION": {
+        "pattern": r"syscall=bpf",
+        "desc": "BPF系统调用操作",
+        "severity": "LOW"
+    },
+    "CRITICAL_FILE_CHANGE": {
+        "pattern": r"key=\"CRITICAL_FILE\"",
+        "desc": "关键文件被修改",
+        "severity": "HIGH"
+    }
+}
+
+class AuditMonitor:
+    def __init__(self):
+        self.log_path = config.get('DEFAULT', 'LOG_PATH', fallback="/var/log/audit/audit.log")
+        self.last_pos = 0
+        self.arch = get_audit_arch()
+        print(f"检测到系统架构: {platform.machine()}, 使用审计架构: {self.arch}")
+        self.setup_audit_rules()
+        self.alert_count = 0
+        self.start_time = datetime.now()
+        self.alert_file = config.get('DEFAULT', 'ALERT_FILE', fallback="security_alerts.json")
+    
+    def setup_audit_rules(self):
+        """配置内核审计规则 - 使用正确的架构标识符"""
+        rules = [
+            f"-a always,exit -F arch={self.arch} -S execve -k PROCESS_EXEC",
+            f"-a always,exit -F arch={self.arch} -S mount -k FS_CHANGE",
+            f"-a always,exit -F arch={self.arch} -S ptrace -k PROCESS_DEBUG",
+            f"-a always,exit -F arch={self.arch} -S keyctl -k KEY_MANIPULATION",
+            f"-a always,exit -F arch={self.arch} -S bpf -k BPF_OPERATION"
+        ]
+        
+        # 添加文件监控规则
+        critical_files = config.get('DEFAULT', 'CRITICAL_FILES', 
+                                   fallback="/etc/passwd,/etc/shadow,/etc/sudoers,/bin/bash,/usr/bin/sudo,/usr/bin/docker").split(',')
+        
+        for file in critical_files:
+            try:
+                subprocess.run(f"auditctl -w {file} -p warx -k CRITICAL_FILE", 
+                              shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                print(f"已添加文件监控: {file}")
+            except subprocess.CalledProcessError as e:
+                print(f"添加文件监控规则失败: {e.stderr.decode().strip()}")
+        
+        # 添加系统调用规则
+        for rule in rules:
+            try:
+                result = subprocess.run(f"auditctl {rule}", 
+                                       shell=True, check=True, 
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                print(f"规则添加成功: {rule}")
+            except subprocess.CalledProcessError as e:
+                print(f"添加规则失败: {rule}")
+                print(f"错误信息: {e.stderr.decode().strip()}")
+    
+    def cleanup_rules(self):
+        """清理审计规则"""
+        try:
+            subprocess.run("auditctl -D", shell=True, check=True)
+            print("已清理所有审计规则")
+        except subprocess.CalledProcessError as e:
+            print(f"清理规则失败: {e.stderr.decode().strip()}")
+    
+    def get_new_events(self):
+        """获取新增审计事件"""
+        if not os.path.exists(self.log_path):
+            print(f"审计日志文件不存在: {self.log_path}")
+            return []
+        
+        try:
+            with open(self.log_path, "r") as f:
+                f.seek(self.last_pos)
+                new_events = f.readlines()
+                self.last_pos = f.tell()
+            
+            return [e.strip() for e in new_events if e.strip()]
+        except Exception as e:
+            print(f"读取日志文件错误: {e}")
+            return []
+    
+    def extract_event_details(self, event):
+        """从审计事件中提取关键信息"""
+        details = {
+            "syscall": re.search(r"syscall=(\w+)", event),
+            "pid": re.search(r"pid=(\d+)", event),
+            "uid": re.search(r"uid=(\d+)", event),
+            "auid": re.search(r"auid=(\d+)", event),
+            "exe": re.search(r"exe=\"(.+?)\"", event),
+            "key": re.search(r"key=\"(.+?)\"", event)
+        }
+        
+        # 转换为简单字典
+        return {k: v.group(1) if v else None for k, v in details.items()}
+    
+    def analyze_event(self, event):
+        """分析单个审计事件"""
+        for rule_id, rule in SECURITY_RULES.items():
+            if re.search(rule["pattern"], event):
+                details = self.extract_event_details(event)
+                return {
+                    "rule_id": rule_id,
+                    "description": rule["desc"],
+                    "severity": rule["severity"],
+                    "timestamp": datetime.now().isoformat(),
+                    "raw_event": event,
+                    "details": details
+                }
+        return None
+    
+    def send_alert(self, alert_data):
+        """发送安全告警"""
+        try:
+            # 构建邮件内容
+            msg = MIMEMultipart()
+            msg['Subject'] = f"[{alert_data['severity']}] 安全告警: {alert_data['rule_id']}"
+            msg['From'] = config.get('EMAIL', 'FROM', fallback='audit-alert@localhost')
+            msg['To'] = config.get('EMAIL', 'TO', fallback='admin@localhost')
+            
+            # 邮件正文
+            body = f"""
+            ==== 安全事件详情 ====
+            规则类型: {alert_data['rule_id']} ({alert_data['severity']})
+            描述: {alert_data['description']}
+            发生时间: {alert_data['timestamp']}
+            
+            ==== 关键信息 ====
+            系统调用: {alert_data['details']['syscall'] or 'N/A'}
+            进程ID: {alert_data['details']['pid'] or 'N/A'}
+            用户ID: {alert_data['details']['uid'] or 'N/A'}
+            审计ID: {alert_data['details']['auid'] or 'N/A'}
+            执行文件: {alert_data['details']['exe'] or 'N/A'}
+            规则键: {alert_data['details']['key'] or 'N/A'}
+            
+            ==== 原始日志 ====
+            {alert_data['raw_event']}
+            
+            ==== 行动建议 ====
+            1. 检查相关进程: ps aux | grep {alert_data['details']['pid'] or '<PID>'}
+            2. 审查系统调用: ausearch -sc {alert_data['details']['syscall'] or '<SYSCALL>'} -ts today
+            3. 查看完整审计日志: less {self.log_path}
+            """
+            
+            msg.attach(MIMEText(body, 'plain'))
+            
+            # 发送邮件
+            smtp_server = config.get('EMAIL', 'SMTP_SERVER', fallback='localhost')
+            smtp_port = config.getint('EMAIL', 'SMTP_PORT', fallback=25)
+            
+            with smtplib.SMTP(smtp_server, smtp_port) as server:
+                server.send_message(msg)
+            
+            self.alert_count += 1
+            return True
+        except Exception as e:
+            print(f"邮件发送失败: {e}")
+            return False
+    
+    def run(self):
+        print(f"开始监控审计日志: {self.log_path}")
+        print(f"系统启动时间: {self.start_time}")
+        print("按 Ctrl+C 停止监控...")
+        
+        try:
+            while True:
+                events = self.get_new_events()
+                for event in events:
+                    alert = self.analyze_event(event)
+                    if alert:
+                        print(f"[{alert['severity']}] 检测到安全事件: {alert['rule_id']}")
+                        self.send_alert(alert)
+                        with open(self.alert_file, "a") as f:
+                            f.write(json.dumps(alert) + "\n")
+                
+                # 每5秒检查一次新日志
+                time.sleep(5)
+        except KeyboardInterrupt:
+            print("\n监控已停止")
+        finally:
+            self.cleanup_rules()
+            print(f"总计检测到 {self.alert_count} 个安全事件")
+            print(f"运行时长: {datetime.now() - self.start_time}")
+            print(f"告警文件已保存至: {self.alert_file}")
+
+if __name__ == "__main__":
+    monitor = AuditMonitor()
+    monitor.run()
