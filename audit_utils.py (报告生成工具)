@@ -1,0 +1,69 @@
+import matplotlib.pyplot as plt
+import json
+from collections import Counter
+from datetime import datetime
+import os
+
+def generate_report(alerts_file="security_alerts.json", report_prefix="security_report"):
+    """生成安全报告"""
+    if not os.path.exists(alerts_file):
+        print(f"警告: 未找到告警文件 {alerts_file}")
+        return
+    
+    with open(alerts_file, "r") as f:
+        alerts = [json.loads(line) for line in f]
+    
+    if not alerts:
+        print("没有安全事件可生成报告")
+        return
+    
+    # 事件类型统计
+    event_types = Counter([a['rule_id'] for a in alerts])
+    plt.figure(figsize=(10, 6))
+    plt.bar(event_types.keys(), event_types.values())
+    plt.title("安全事件类型分布")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(f"{report_prefix}_distribution.png")
+    
+    # 时间线分析
+    timestamps = [datetime.fromisoformat(a['timestamp']) for a in alerts]
+    plt.figure(figsize=(12, 4))
+    plt.plot(timestamps, range(len(timestamps)), 'ro-')
+    plt.title("安全事件时间线")
+    plt.tight_layout()
+    plt.savefig(f"{report_prefix}_timeline.png")
+    
+    # 严重级别统计
+    severities = Counter([a['severity'] for a in alerts])
+    plt.figure(figsize=(8, 8))
+    plt.pie(severities.values(), labels=severities.keys(), autopct='%1.1f%%')
+    plt.title("安全事件严重级别分布")
+    plt.savefig(f"{report_prefix}_severity.png")
+    
+    # 生成文本报告
+    report = f"""
+    ===== 安全审计报告 =====
+    生成时间: {datetime.now().isoformat()}
+    时间范围: {timestamps[0]} 至 {timestamps[-1]}
+    总事件数: {len(alerts)}
+    
+    == 事件类型统计 ==
+    {event_types.most_common()}
+    
+    == 严重级别统计 ==
+    {severities.most_common()}
+    
+    == 最近5个事件 ==
+    {json.dumps(alerts[-5:], indent=2, ensure_ascii=False)}
+    """
+    with open(f"{report_prefix}.txt", "w") as f:
+        f.write(report)
+    
+    print(f"已生成报告: {report_prefix}.txt 和图表")
+    print(f"1. 事件分布图: {report_prefix}_distribution.png")
+    print(f"2. 时间线图: {report_prefix}_timeline.png")
+    print(f"3. 严重级别图: {report_prefix}_severity.png")
+
+if __name__ == "__main__":
+    generate_report()
